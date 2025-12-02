@@ -1,6 +1,7 @@
 import serial
 import time
 import datetime
+import sys
 
 # --- CONFIGURAZIONE ---
 PORTA = "/dev/rfcomm0"  # O 'COM3' su Windows
