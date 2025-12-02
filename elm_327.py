@@ -1,157 +1,116 @@
 import serial
 import time
 import datetime
-import sender
+import re
 
-# --- CONFIGURAZIONE ---
-PORTA = "/dev/rfcomm0"  # O 'COM3' su Windows
-BAUDRATE = 38400
-# ----------------------
+# CONFIG
+PORTA = "/dev/rfcomm0"
+BAUDRATE = 9600
+READ_BUFFER_TIMEOUT = 0.8
+LOG_FILE = "data_log.txt"
 
-# Dizionario dei PID per Golf 7 (Mode 01)
 PIDS_DA_LEGGERE = {
     "0104": ("Carico Motore", "%"),
     "0105": ("Temp. Liquido Raffred.", "°C"),
-    "010B": ("Pressione Turbo/MAP", "kPa"), # Importante per TSI/TDI
+    "010B": ("Pressione Turbo/MAP", "kPa"),
     "010C": ("Giri Motore (RPM)", "rpm"),
     "010D": ("Velocità Veicolo", "km/h"),
     "010F": ("Temp. Aria Aspirata", "°C"),
     "0110": ("MAF (Flusso Aria)", "g/s"),
     "0111": ("Posizione Farfalla", "%"),
     "0142": ("Voltaggio Centralina", "V"),
-    # Questi sotto potrebbero non andare su tutte le Golf 7:
-    "012F": ("Livello Carburante", "%"), 
-    "015C": ("Temp. Olio Motore", "°C"), 
+    "012F": ("Livello Carburante", "%"),
+    "015C": ("Temp. Olio Motore", "°C"),
     "0133": ("Pressione Barometrica", "kPa"),
 }
 
-# --- FORMULE DI CONVERSIONE (Dictionary Dispatch) ---
-# Mappa il PID a una funzione lambda che accetta A e B
 PID_FORMULAS = {
-    "0104": lambda A, B: (A * 100) / 255,          # Carico Motore
-    "0105": lambda A, B: A - 40,                   # Temp Acqua
-    "010B": lambda A, B: A,                        # MAP
-    "010C": lambda A, B: ((A * 256) + B) / 4,      # RPM
-    "010D": lambda A, B: A,                        # Velocità
-    "010F": lambda A, B: A - 40,                   # Temp Aria
-    "0110": lambda A, B: ((A * 256) + B) / 100,    # MAF
-    "0111": lambda A, B: (A * 100) / 255,          # Farfalla
-    "012F": lambda A, B: (A * 100) / 255,          # Carburante
-    "0133": lambda A, B: A,                        # Press. Barometrica
-    "0142": lambda A, B: ((A * 256) + B) / 1000,   # Voltaggio
-    "015C": lambda A, B: A - 40,                   # Temp Olio
+    "0104": lambda A, B: (A * 100) / 255,
+    "0105": lambda A, B: A - 40,
+    "010B": lambda A, B: A,
+    "010C": lambda A, B: ((A * 256) + B) / 4,
+    "010D": lambda A, B: A,
+    "010F": lambda A, B: A - 40,
+    "0110": lambda A, B: ((A * 256) + B) / 100,
+    "0111": lambda A, B: (A * 100) / 255,
+    "012F": lambda A, B: (A * 100) / 255,
+    "0133": lambda A, B: A,
+    "0142": lambda A, B: ((A * 256) + B) / 1000,
+    "015C": lambda A, B: A - 40,
 }
 
-# Teniamo traccia dei PID che sappiamo già non essere supportati per non intasare il log
-pids_non_supportati = set()
-
 def init_adattatore(ser):
-    """Inizializza l'ELM327"""
-    comandi = [
-        "ATZ",      # Reset
-        "ATE0",     # Echo Off
-        "ATL0",     # Linefeeds Off
-        "ATSP6",    # Protocollo ISO 15765-4 CAN (Golf 7)
-        "ATSH7E0",  # Header 7E0 (Standard Engine ECU per VW)
-        "0100"      # Handshake di prova
-    ]
-    print("🔌 Inizializzazione OBD (Golf 7 Profile)...")
-    for cmd in comandi:
-        ser.write((cmd + '\r').encode('utf-8'))
-        time.sleep(0.2)
+    for cmd in ["ATZ","ATE0","ATL0","ATSP6","0100"]:
+        ser.write((cmd+"\r").encode())
+        time.sleep(0.5)
         ser.read_all()
-    print("✅ Connesso. Inizio scansione...")
-    time.sleep(1)
+    time.sleep(0.5)
 
-def chiedi_pid(ser, pid):
-    """Richiede un PID specifico"""
-    ser.write((pid + '\r').encode('utf-8'))
-    time.sleep(0.08) # Ottimizzato per CAN bus veloce
-    raw = ser.read_all().decode('utf-8', errors='ignore')
-    return raw.replace('\r', '').replace('\n', '').replace('>', '').strip()
+def read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT):
+    deadline = time.time() + timeout
+    buf = ""
+    while time.time() < deadline:
+        part = ser.read_all().decode('utf-8', errors='ignore')
+        if part:
+            buf += part
+            deadline = time.time() + 0.08
+        else:
+            time.sleep(0.02)
+    return re.sub(r'[\r\n]+', ' ', buf).strip()
 
-def interpreta_dati(pid, hex_data):
-    """Applica la formula corretta in base al PID"""
-    try:
-        parts = hex_data.split()
-        
-        # Gestione risposta "NO DATA" (PID non supportato dalla Golf)
-        if "NO DATA" in hex_data:
-            return "UNSUPPORTED"
-
-        # Verifica header risposta (41 + PID)
-        expected_header = "41" + pid[2:]
-        
-        # Controllo robustezza: deve contenere l'header corretto
-        if len(parts) < 3 or expected_header not in parts[0] + parts[1]:
-            return None
-
-        # Trova dove inizia la risposta dati
+def try_parse(pid, raw):
+    if not raw: return None
+    s = raw.upper()
+    if "NO DATA" in s: return None
+    pid_byte = pid[2:].upper()
+    m = re.search(r'41\W+' + re.escape(pid_byte) + r'\W+([0-9A-F]{2})(?:\W+([0-9A-F]{2}))?', s)
+    if m:
         try:
-            if parts[0] == expected_header:
-                idx = 1
-            elif parts[0] + parts[1] == expected_header:
-                idx = 2
-            else:
-                idx = parts.index(expected_header) + 1 # Fallback
-        except ValueError:
-            # A volte capita se la stringa è sporca
+            A = int(m.group(1),16)
+            B = int(m.group(2),16) if m.group(2) else 0
+            fn = PID_FORMULAS.get(pid)
+            return fn(A,B) if fn else None
+        except:
             return None
-
-        dati = [int(x, 16) for x in parts[idx:]]
-        if not dati: return None
-        
-        A = dati[0]
-        B = dati[1] if len(dati) > 1 else 0
-
-        # --- CALCOLO VALORE ---
-        # Cerca la formula nel dizionario ed eseguila direttamente
-        if pid in PID_FORMULAS:
-            return PID_FORMULAS[pid](A, B)
-
-    except Exception:
-        return None
+    m2 = re.search(r'41\W+([0-9A-F]{2})\W+([0-9A-F]{2})', s)
+    if m2:
+        try:
+            A = int(m2.group(1),16)
+            B = int(m2.group(2),16)
+            fn = PID_FORMULAS.get(pid)
+            return fn(A,B) if fn else None
+        except:
+            return None
     return None
 
-# --- MAIN LOOP ---
 try:
-    ser = serial.Serial(PORTA, BAUDRATE, timeout=0.5)
+    ser = serial.Serial(PORTA, BAUDRATE, timeout=1)
     init_adattatore(ser)
 
-    print(f"{'TIMESTAMP':<15} | {'PID':<6} | {'DESCRIZIONE':<22} | {'VALORE':<15} | {'NOTE'}")
-    print("-" * 80)
+    print(f"{'TIMESTAMP':<15} | {'PID':<6} | {'DESCRIZIONE':<22} | {'VALORE':<18} | RAW")
+    print("-"*120)
 
     while True:
-        for pid_code, (descrizione, unita) in PIDS_DA_LEGGERE.items():
-            
-            # Se sappiamo già che la Golf non supporta questo PID, saltiamolo per velocizzare
-            if pid_code in pids_non_supportati:
-                continue
+        for pid, (desc, unit) in PIDS_DA_LEGGERE.items():
+            ser.write((pid + '\r').encode())
+            time.sleep(0.05)
+            raw = read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT)
+            raw_norm = raw.replace('>', ' ').strip()
+            parsed = try_parse(pid, raw_norm)
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            if isinstance(parsed, (int,float)):
+                valstr = f"{parsed:.2f} {unit}"
+            else:
+                valstr = "N/A"
+            print(f"{timestamp:<15} | {pid:<6} | {desc:<22} | {valstr:<18} | {raw_norm}")
 
-            raw_response = chiedi_pid(ser, pid_code)
-            valore = interpreta_dati(pid_code, raw_response)
-            
-            if valore == "UNSUPPORTED":
-                # Lo segniamo come non supportato e lo stampiamo una volta sola
-                pids_non_supportati.add(pid_code)
-                print(f"{'---':<15} | {pid_code:<6} | {descrizione:<22} | {'NON SUPPORTATO':<15} | NO DATA")
-            
-            elif isinstance(valore, (int, float)):
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                str_valore = f"{valore:.2f} {unita}"
+            # append log
+            with open(LOG_FILE, "a") as f:
+                f.write(f"{timestamp}, {pid}, {desc}, {valstr}, {raw_norm}\n")
 
-                with open("data_log.txt", "a") as log_file:
-                    log_file.write(f"{timestamp}, {pid_code}, {descrizione}, {str_valore}, {raw_response}\n")
-                    
-                print(f"{timestamp:<15} | {pid_code:<6} | {descrizione:<22} | {str_valore:<15} | {raw_response}")
-
-            
-            # Piccola pausa anti-flood
-            time.sleep(0.02) 
+            time.sleep(0.03)
 
 except KeyboardInterrupt:
-    print("\nChiusura connessione.")
-    if 'ser' in locals() and ser.is_open:
-        ser.close()
+    if 'ser' in locals() and ser.is_open: ser.close()
 except Exception as e:
-    print(f"Errore critico: {e}")
+    print("Errore:", e)
