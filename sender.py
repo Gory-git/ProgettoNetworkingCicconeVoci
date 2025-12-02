@@ -1,105 +1,116 @@
-#!/usr/bin/python3
-from time import sleep
-import paho.mqtt.client as mqtt
-import ssl
+import serial
+import time
+import datetime
+import re
 
-topic = "#"
+# CONFIG
+PORTA = "/dev/rfcomm0"
+BAUDRATE = 9600
+READ_BUFFER_TIMEOUT = 0.8
+LOG_FILE = "data_log.txt"
 
-# Configurazione del client MQTT
-mqtt_config = {
-    "broker_address": "212.227.85.109",
-    "port": 8883,
-    "username": "spintel",
-    "password": "Sp1nt3l_2022",
-    "tls_certfile": "certs/client.crt",
-    "tls_keyfile": "certs/client.key",
+PIDS_DA_LEGGERE = {
+    "0104": ("Carico Motore", "%"),
+    "0105": ("Temp. Liquido Raffred.", "°C"),
+    "010B": ("Pressione Turbo/MAP", "kPa"),
+    "010C": ("Giri Motore (RPM)", "rpm"),
+    "010D": ("Velocità Veicolo", "km/h"),
+    "010F": ("Temp. Aria Aspirata", "°C"),
+    "0110": ("MAF (Flusso Aria)", "g/s"),
+    "0111": ("Posizione Farfalla", "%"),
+    "0142": ("Voltaggio Centralina", "V"),
+    "012F": ("Livello Carburante", "%"),
+    "015C": ("Temp. Olio Motore", "°C"),
+    "0133": ("Pressione Barometrica", "kPa"),
 }
 
-# Configurazione del contesto SSL per il supporto TLS
-tls_context = ssl.create_default_context()
-tls_context.check_hostname = False
-tls_context.verify_mode = ssl.CERT_NONE
-tls_context.load_cert_chain(certfile=mqtt_config["tls_certfile"], keyfile=mqtt_config["tls_keyfile"])
+PID_FORMULAS = {
+    "0104": lambda A, B: (A * 100) / 255,
+    "0105": lambda A, B: A - 40,
+    "010B": lambda A, B: A,
+    "010C": lambda A, B: ((A * 256) + B) / 4,
+    "010D": lambda A, B: A,
+    "010F": lambda A, B: A - 40,
+    "0110": lambda A, B: ((A * 256) + B) / 100,
+    "0111": lambda A, B: (A * 100) / 255,
+    "012F": lambda A, B: (A * 100) / 255,
+    "0133": lambda A, B: A,
+    "0142": lambda A, B: ((A * 256) + B) / 1000,
+    "015C": lambda A, B: A - 40,
+}
 
-# Creazione del client MQTT
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+def init_adattatore(ser):
+    for cmd in ["ATZ","ATE0","ATL0","ATSP6","0100"]:
+        ser.write((cmd+"\r").encode())
+        time.sleep(0.5)
+        ser.read_all()
+    time.sleep(0.5)
 
-# Funzione di callback quando si riceve un messaggio
-def on_message(client, userdata, message):
-    print(f"Topic: {message.topic}\nMessage: {message.payload.decode()}\n")
+def read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT):
+    deadline = time.time() + timeout
+    buf = ""
+    while time.time() < deadline:
+        part = ser.read_all().decode('utf-8', errors='ignore')
+        if part:
+            buf += part
+            deadline = time.time() + 0.08
+        else:
+            time.sleep(0.02)
+    return re.sub(r'[\r\n]+', ' ', buf).strip()
 
+def try_parse(pid, raw):
+    if not raw: return None
+    s = raw.upper()
+    if "NO DATA" in s: return None
+    pid_byte = pid[2:].upper()
+    m = re.search(r'41\W+' + re.escape(pid_byte) + r'\W+([0-9A-F]{2})(?:\W+([0-9A-F]{2}))?', s)
+    if m:
+        try:
+            A = int(m.group(1),16)
+            B = int(m.group(2),16) if m.group(2) else 0
+            fn = PID_FORMULAS.get(pid)
+            return fn(A,B) if fn else None
+        except:
+            return None
+    m2 = re.search(r'41\W+([0-9A-F]{2})\W+([0-9A-F]{2})', s)
+    if m2:
+        try:
+            A = int(m2.group(1),16)
+            B = int(m2.group(2),16)
+            fn = PID_FORMULAS.get(pid)
+            return fn(A,B) if fn else None
+        except:
+            return None
+    return None
 
-def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"Connected with result code {reason_code}")
-    # Subscrive nel caso di riconnessione, se necessario
-    client.subscribe(topic)
+try:
+    ser = serial.Serial(PORTA, BAUDRATE, timeout=1)
+    init_adattatore(ser)
 
+    print(f"{'TIMESTAMP':<15} | {'PID':<6} | {'DESCRIZIONE':<22} | {'VALORE':<18} | RAW")
+    print("-"*120)
 
-# Funzione per pubblicare un messaggio su un topic specifico
-def publish_message(client, message, topic):
-    result = client.publish(topic, message)
-    status = result.rc
-    if status == mqtt.MQTT_ERR_SUCCESS:
-        print(f"✅ Messaggio '{message}' inviato al topic '{topic}'")
-    else:
-        print(f"❌ Errore nell'inviare il messaggio '{message}' al topic '{topic}'")
+    while True:
+        for pid, (desc, unit) in PIDS_DA_LEGGERE.items():
+            ser.write((pid + '\r').encode())
+            time.sleep(0.05)
+            raw = read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT)
+            raw_norm = raw.replace('>', ' ').strip()
+            parsed = try_parse(pid, raw_norm)
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            if isinstance(parsed, (int,float)):
+                valstr = f"{parsed:.2f} {unit}"
+            else:
+                valstr = "N/A"
+            print(f"{timestamp:<15} | {pid:<6} | {desc:<22} | {valstr:<18} | {raw_norm}")
 
+            # append log
+            with open(LOG_FILE, "a") as f:
+                f.write(f"{timestamp}, {pid}, {desc}, {valstr}, {raw_norm}\n")
 
-def set_topic(topic_new):
-    global topic
-    topic = topic_new
+            time.sleep(0.03)
 
-def inizializza():
-    # Imposta il contesto TLS
-    client.tls_set_context(tls_context)
-
-    # Imposta le credenziali
-    client.username_pw_set(mqtt_config["username"], mqtt_config["password"])
-
-    # Imposta i callback
-    client.on_connect = on_connect
-    client.on_message = on_message
-
-    # Connessione al broker MQTT
-    client.connect(mqtt_config["broker_address"], mqtt_config["port"])
-
-
-# Funzione per leggere il file di log e inviare i messaggi MQTT
-def publish_from_log(file_path):
-    try:
-        with open(file_path, 'r') as file:
-            for line in file:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Suddividi il topic e il messaggio
-                try:
-                    topic_prefix, message = line.split(':', 1)
-                    topic = f"sumo/{topic_prefix}"
-
-                    publish_message(client, topic, message)
-
-                    # Pausa di 1 secondo tra i messaggi
-                    sleep(1)
-
-                except ValueError:
-                    print(f"❌ Riga non valida nel file di log: {line}")
-
-    except FileNotFoundError:
-        print(f"❌ File non trovato: {file_path}")
-    except Exception as e:
-        print(f"❌ Errore durante la lettura del file: {e}")
-
-def run():
-    # Esegui il client in modalità non bloccante
-    client.loop_start()
-
-# Percorso del file di log
-log_file_path = 'log.txt'  # Sostituisci con il percorso reale del tuo file di log
-# publish_from_log(log_file_path)
-
-# Termina il loop del client dopo la pubblicazione
-def stop():
-    client.loop_stop()
-    client.disconnect()
+except KeyboardInterrupt:
+    if 'ser' in locals() and ser.is_open: ser.close()
+except Exception as e:
+    print("Errore:", e)
