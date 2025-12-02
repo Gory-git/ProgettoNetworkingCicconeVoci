@@ -1,7 +1,7 @@
 import serial
 import time
 import datetime
-import sys
+import sender
 
 # --- CONFIGURAZIONE ---
 PORTA = "/dev/rfcomm0"  # O 'COM3' su Windows
@@ -139,7 +139,12 @@ try:
             elif isinstance(valore, (int, float)):
                 timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 str_valore = f"{valore:.2f} {unita}"
+
+                with open("data_log.txt", "a") as log_file:
+                    log_file.write(f"{timestamp}, {pid_code}, {descrizione}, {str_valore}, {raw_response}\n")
+                    
                 print(f"{timestamp:<15} | {pid_code:<6} | {descrizione:<22} | {str_valore:<15} | {raw_response}")
+
             
             # Piccola pausa anti-flood
             time.sleep(0.02) 
