@@ -84,14 +84,16 @@ def try_parse(pid, raw):
     return None
 
 try:
-    ser = serial.Serial(PORTA, BAUDRATE, timeout=1)
+    ser = serial.Serial(PORTA, BAUDRATE, timeout=2)
     init_adattatore(ser)
 
     print(f"{'TIMESTAMP':<15} | {'PID':<6} | {'DESCRIZIONE':<22} | {'VALORE':<18} | RAW")
     print("-"*120)
 
     while True:
+        stringa_mammata = ""
         for pid, (desc, unit) in PIDS_DA_LEGGERE.items():
+
             ser.write((pid + '\r').encode())
             time.sleep(0.05)
             raw = read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT)
@@ -102,13 +104,12 @@ try:
                 valstr = f"{parsed:.2f} {unit}"
             else:
                 valstr = "N/A"
-            print(f"{timestamp:<15} | {pid:<6} | {desc:<22} | {valstr:<18} | {raw_norm}")
-
-            # append log
-            with open(LOG_FILE, "a") as f:
-                f.write(f"{timestamp}, {pid}, {desc}, {valstr}, {raw_norm}\n")
-
+            stringa_mammata += (f"{timestamp:<15} | {pid:<6} | {desc:<22} | {valstr:<18} | {raw_norm} § ")
             time.sleep(0.03)
+
+        with open(LOG_FILE, "a") as f:
+            f.write(stringa_mammata + "\n")
+        stringa_mammata = ""
 
 except KeyboardInterrupt:
     if 'ser' in locals() and ser.is_open: ser.close()
