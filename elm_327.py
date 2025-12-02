@@ -1,7 +1,7 @@
 import serial
 import time
 import datetime
-import sender
+import re
 
 # CONFIG
 PORTA = "/dev/rfcomm0"
@@ -84,39 +84,34 @@ def try_parse(pid, raw):
     return None
 
 try:
-    ser = serial.Serial(PORTA, BAUDRATE, timeout=1)
+    ser = serial.Serial(PORTA, BAUDRATE, timeout=2)
     init_adattatore(ser)
 
     print(f"{'TIMESTAMP':<15} | {'PID':<6} | {'DESCRIZIONE':<22} | {'VALORE':<18} | RAW")
     print("-"*120)
 
     while True:
-        for pid_code, (descrizione, unita) in PIDS_DA_LEGGERE.items():
-            
-            # Se sappiamo già che la Golf non supporta questo PID, saltiamolo per velocizzare
-            if pid_code in pids_non_supportati:
-                continue
+        stringa_mammata = ""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        stringa_mammata += timestamp + " : "
+        for pid, (desc, unit) in PIDS_DA_LEGGERE.items():
 
-            raw_response = chiedi_pid(ser, pid_code)
-            valore = interpreta_dati(pid_code, raw_response)
-            
-            if valore == "UNSUPPORTED":
-                # Lo segniamo come non supportato e lo stampiamo una volta sola
-                pids_non_supportati.add(pid_code)
-                print(f"{'---':<15} | {pid_code:<6} | {descrizione:<22} | {'NON SUPPORTATO':<15} | NO DATA")
-            
-            elif isinstance(valore, (int, float)):
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                str_valore = f"{valore:.2f} {unita}"
+            ser.write((pid + '\r').encode())
+            time.sleep(0.05)
+            raw = read_all_until_timeout(ser, timeout=READ_BUFFER_TIMEOUT)
+            raw_norm = raw.replace('>', ' ').strip()
+            parsed = try_parse(pid, raw_norm)
 
-                with open("data_log.txt", "a") as log_file:
-                    log_file.write(f"{timestamp}, {pid_code}, {descrizione}, {str_valore}, {raw_response}\n")
-                    
-                print(f"{timestamp:<15} | {pid_code:<6} | {descrizione:<22} | {str_valore:<15} | {raw_response}")
+            if isinstance(parsed, (int,float)):
+                valstr = f"{parsed:.2f} {unit}"
+            else:
+                valstr = "N/A"
+            stringa_mammata += (f"{pid:<6} | {desc:<22} | {valstr:<18} | {raw_norm} § ")
+            time.sleep(0.03)
 
-            
-            # Piccola pausa anti-flood
-            time.sleep(0.02) 
+        with open(LOG_FILE, "a") as f:
+            f.write(stringa_mammata + "\n")
+        stringa_mammata = ""
 
 except KeyboardInterrupt:
     if 'ser' in locals() and ser.is_open: ser.close()
